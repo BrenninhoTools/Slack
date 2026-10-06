@@ -1,14 +1,28 @@
 import { createServer } from 'node:http';
+import { dirname, join } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
-import type { ClientEvent, ServerEvent } from '../../src/shared/protocol';
+import type { BotConfig, ClientEvent, ServerEvent } from '../../src/shared/protocol';
+import * as bot from './bot';
+import { createRequestHandler } from './http';
+import { MediaStore } from './media';
 import { Store, StoreError } from './store';
 
 const PORT = Number(process.env.PORT ?? 3001);
 const DATA_FILE = process.env.DATA_FILE === '' ? null : (process.env.DATA_FILE ?? 'data/slack.json');
+const UPLOAD_DIR = process.env.UPLOAD_DIR ?? join(dirname(DATA_FILE ?? 'data/slack.json'), 'uploads');
+/** Comma-separated usernames that moderate the Public Square. */
+const ADMINS = new Set(
+  (process.env.ADMIN_USERNAMES ?? '')
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 const RATE_WINDOW_MS = 10_000;
 const RATE_MAX_EVENTS = 40;
 const HEARTBEAT_MS = 30_000;
+const SWEEP_INTERVAL_MS = 10 * 60_000;
+const ORPHAN_UPLOAD_MAX_AGE_MS = 60 * 60_000;
 
 interface Client {
   ws: WebSocket;
@@ -18,21 +32,14 @@ interface Client {
   recent: number[];
 }
 
-const store = new Store(DATA_FILE);
+const media = new MediaStore(UPLOAD_DIR);
+const store = new Store(DATA_FILE, media, ADMINS);
 /** Every open socket, authenticated or not. */
 const sockets = new Map<WebSocket, Client>();
 /** Authenticated clients grouped by user (one user can have several windows). */
 const connections = new Map<string, Set<Client>>();
 
-const http = createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', online: connections.size }));
-    return;
-  }
-  res.writeHead(404).end();
-});
-
+const http = createServer(createRequestHandler({ store, media, onlineUsers: () => connections.size }));
 const wss = new WebSocketServer({ server: http, maxPayload: 16 * 1024 });
 
 // ------------------------------------------------------------------ sending
@@ -54,6 +61,34 @@ function sendToUsers(userIds: Iterable<string>, event: ServerEvent, exceptUserId
 function onlineAmong(userId: string): string[] {
   return [...store.audience(userId)].filter((id) => connections.has(id));
 }
+
+function broadcastGuild(guildId: string): void {
+  sendToUsers(store.memberIdsOf(guildId), { type: 'guild_update', guild: store.getGuild(guildId) });
+}
+
+function broadcastMessage(channelId: string, message: ReturnType<Store['addBotMessage']>): void {
+  sendToUsers(store.memberIdsOf(store.guildIdOfChannel(channelId)), { type: 'message_create', message });
+}
+
+function removeMember(guildId: string, userId: string, reason: 'kicked' | 'banned'): void {
+  sendToUser(userId, { type: 'guild_remove', guildId, reason });
+  broadcastGuild(guildId);
+}
+
+// ---------------------------------------------------------------------- bot
+
+const botHooks: bot.BotHooks = {
+  say(channelId, text) {
+    broadcastMessage(channelId, store.addBotMessage(channelId, text));
+  },
+  guildChanged: broadcastGuild,
+  memberRemoved: (guildId, userId, reason) => removeMember(guildId, userId, reason),
+  messagesDeleted(channelId, messageIds) {
+    const members = store.memberIdsOf(store.guildIdOfChannel(channelId));
+    for (const messageId of messageIds) sendToUsers(members, { type: 'message_delete', channelId, messageId });
+  },
+  isOnline: (userId) => connections.has(userId)
+};
 
 // --------------------------------------------------------------------- auth
 
@@ -111,6 +146,7 @@ function handle(client: Client, event: ClientEvent): void {
 
   const userId = client.userId;
   if (!userId) throw new StoreError('not_authenticated', 'Please log in first.');
+  const notice = (message: string) => send(client.ws, { type: 'notice', message });
 
   switch (event.type) {
     case 'logout': {
@@ -123,7 +159,8 @@ function handle(client: Client, event: ClientEvent): void {
       const user = store.updateProfile(userId, {
         displayName: str(event.displayName),
         bio: str(event.bio),
-        color: str(event.color)
+        color: str(event.color),
+        avatar: optionalId(event.avatar)
       });
       sendToUsers(store.audience(userId), { type: 'user_update', user });
       return;
@@ -133,6 +170,8 @@ function handle(client: Client, event: ClientEvent): void {
       send(client.ws, { type: 'password_changed' });
       return;
     }
+
+    // ------------------------------------------------------- communities
     case 'create_guild': {
       const guild = store.createGuild(userId, str(event.name));
       send(client.ws, { type: 'guild_create', guild, online: onlineAmong(userId) });
@@ -145,14 +184,56 @@ function handle(client: Client, event: ClientEvent): void {
         const others = store.memberIdsOf(guild.id);
         sendToUsers(others, { type: 'guild_update', guild }, userId);
         sendToUsers(others, { type: 'presence_update', userId, online: true }, userId);
+        bot.welcome(store, botHooks, guild.id, store.publicUser(userId));
       }
+      return;
+    }
+    case 'leave_guild': {
+      const guildId = str(event.guildId);
+      store.leaveGuild(userId, guildId);
+      send(client.ws, { type: 'guild_remove', guildId, reason: 'left' });
+      broadcastGuild(guildId);
+      return;
+    }
+    case 'delete_guild': {
+      const guildId = str(event.guildId);
+      const members = store.deleteGuild(userId, guildId);
+      sendToUsers(members, { type: 'guild_remove', guildId, reason: 'deleted' });
+      return;
+    }
+    case 'update_guild': {
+      const guildId = str(event.guildId);
+      store.updateGuild(userId, guildId, {
+        name: str(event.name),
+        description: str(event.description),
+        icon: optionalId(event.icon)
+      });
+      broadcastGuild(guildId);
+      return;
+    }
+    case 'regenerate_invite': {
+      const guildId = str(event.guildId);
+      store.regenerateInvite(userId, guildId);
+      broadcastGuild(guildId);
       return;
     }
     case 'create_channel': {
       const guild = store.createChannel(userId, str(event.guildId), str(event.name));
-      sendToUsers(store.memberIdsOf(guild.id), { type: 'guild_update', guild });
+      broadcastGuild(guild.id);
       return;
     }
+    case 'rename_channel': {
+      const guild = store.renameChannel(userId, str(event.channelId), str(event.name));
+      broadcastGuild(guild.id);
+      return;
+    }
+    case 'delete_channel': {
+      const guild = store.deleteChannel(userId, str(event.channelId));
+      broadcastGuild(guild.id);
+      return;
+    }
+
+    // ---------------------------------------------------------- messages
     case 'fetch_history': {
       const channelId = str(event.channelId);
       send(client.ws, { type: 'history', channelId, messages: store.history(userId, channelId) });
@@ -160,9 +241,29 @@ function handle(client: Client, event: ClientEvent): void {
     }
     case 'send_message': {
       const channelId = str(event.channelId);
-      const message = store.addMessage(userId, channelId, str(event.content));
       const { guildId } = store.accessChannel(userId, channelId);
-      sendToUsers(store.memberIdsOf(guildId), { type: 'message_create', message });
+      const content = str(event.content);
+      const attachmentIds = Array.isArray(event.attachmentIds) ? event.attachmentIds.map(str) : [];
+      const sender = store.publicUser(userId);
+
+      // A muted member gets the "muted" error from addMessage instead of being screened again.
+      if (store.muteRemaining(guildId, userId) === 0) {
+        const verdict = bot.screen(store, botHooks, guildId, channelId, sender, content);
+        if (!verdict.ok) throw new StoreError('blocked', verdict.reason);
+      }
+      const message = store.addMessage(userId, channelId, content, attachmentIds);
+      broadcastMessage(channelId, message);
+      bot.handleCommand(store, botHooks, guildId, channelId, sender, content);
+      return;
+    }
+    case 'delete_message': {
+      const channelId = str(event.channelId);
+      store.deleteMessage(userId, channelId, str(event.messageId));
+      sendToUsers(store.memberIdsOf(store.guildIdOfChannel(channelId)), {
+        type: 'message_delete',
+        channelId,
+        messageId: str(event.messageId)
+      });
       return;
     }
     case 'typing': {
@@ -173,6 +274,59 @@ function handle(client: Client, event: ClientEvent): void {
         { type: 'typing', channelId, user: store.publicUser(userId) },
         userId
       );
+      return;
+    }
+
+    // -------------------------------------------------------- moderation
+    case 'set_role': {
+      const guildId = str(event.guildId);
+      const role = event.role === 'moderator' ? 'moderator' : 'member';
+      const targetId = str(event.userId);
+      store.setRole(userId, guildId, targetId, role);
+      broadcastGuild(guildId);
+      notice(role === 'moderator' ? 'Member promoted to moderator.' : 'Moderator role removed.');
+      return;
+    }
+    case 'kick': {
+      const guildId = str(event.guildId);
+      const targetId = str(event.userId);
+      store.kick(userId, guildId, targetId);
+      removeMember(guildId, targetId, 'kicked');
+      notice('Member removed from the community.');
+      return;
+    }
+    case 'ban': {
+      const guildId = str(event.guildId);
+      const targetId = str(event.userId);
+      store.ban(userId, guildId, targetId, str(event.reason));
+      removeMember(guildId, targetId, 'banned');
+      notice('Member banned.');
+      return;
+    }
+    case 'unban': {
+      const guildId = str(event.guildId);
+      store.unban(userId, guildId, str(event.userId));
+      send(client.ws, { type: 'guild_settings', guildId, ...store.guildSettings(userId, guildId) });
+      notice('Member unbanned.');
+      return;
+    }
+    case 'mute': {
+      const minutes = Number(event.minutes);
+      store.mute(userId, str(event.guildId), str(event.userId), minutes);
+      notice(minutes === 0 ? 'Mute lifted.' : `Member muted for ${minutes} minute(s).`);
+      return;
+    }
+    case 'fetch_guild_settings': {
+      const guildId = str(event.guildId);
+      send(client.ws, { type: 'guild_settings', guildId, ...store.guildSettings(userId, guildId) });
+      return;
+    }
+    case 'update_bot': {
+      const guildId = str(event.guildId);
+      store.updateBot(userId, guildId, (event.bot ?? {}) as BotConfig);
+      broadcastGuild(guildId); // the bot appears in or disappears from the member list
+      send(client.ws, { type: 'guild_settings', guildId, ...store.guildSettings(userId, guildId) });
+      notice('Bot settings saved.');
       return;
     }
     default:
@@ -187,6 +341,12 @@ function requireAnonymous(client: Client): void {
 /** Coerces untrusted JSON fields to strings. */
 function str(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+/** undefined = leave unchanged, null = clear, string = an upload id. */
+function optionalId(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  return typeof value === 'string' ? value : undefined;
 }
 
 function rateLimited(client: Client): boolean {
@@ -244,15 +404,23 @@ const heartbeat = setInterval(() => {
   }
 }, HEARTBEAT_MS);
 
+// Uploads that were never attached to a message, avatar or icon are removed after an hour.
+const sweeper = setInterval(() => {
+  const removed = store.sweepUploads(ORPHAN_UPLOAD_MAX_AGE_MS);
+  if (removed > 0) console.log(`[server] removed ${removed} unused upload(s)`);
+}, SWEEP_INTERVAL_MS);
+
 // ----------------------------------------------------------------- lifecycle
 
 http.listen(PORT, () => {
   console.log(`[server] Slack server listening on ws://localhost:${PORT}`);
-  console.log(`[server] data file: ${DATA_FILE ?? '(in-memory only)'}`);
+  console.log(`[server] data file: ${DATA_FILE ?? '(in-memory only)'}  uploads: ${UPLOAD_DIR}`);
+  if (ADMINS.size > 0) console.log(`[server] Public Square moderators: ${[...ADMINS].join(', ')}`);
 });
 
 function shutdown(): void {
   clearInterval(heartbeat);
+  clearInterval(sweeper);
   wss.close();
   store.flush();
   process.exit(0);

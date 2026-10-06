@@ -1,8 +1,9 @@
 import { AVATAR_COLORS, LIMITS, type PublicUser, type ServerEvent } from '../shared/protocol';
 import { avatar } from './avatar';
-import { el } from './dom';
+import { el, fill } from './dom';
 import type { Gateway } from './gateway';
 import { icon, type IconName } from './icons';
+import { pickAndUploadSquare } from './media';
 import { openModal, toast } from './modal';
 import { platformKind } from './platform';
 import {
@@ -19,6 +20,7 @@ import {
 export interface SettingsContext {
   root: HTMLElement;
   gateway: Gateway;
+  token: string;
   getUser(): PublicUser;
   serverUrl: string;
   onLogout(): void;
@@ -106,6 +108,9 @@ export function openSettings(ctx: SettingsContext, onClose: () => void): Setting
   function profileTab(): HTMLElement[] {
     const user = ctx.getUser();
     let color = user.color;
+    // undefined = photo unchanged; an object = a new photo (or removal when id is null) waiting for Save.
+    let pendingPhoto: { id: string | null; previewUrl: string | null } | undefined;
+    let uploading = false;
 
     const nameInput = el('input', { type: 'text', maxlength: LIMITS.displayNameMax, value: user.displayName });
     const bioInput = el('textarea', {
@@ -119,18 +124,61 @@ export function openSettings(ctx: SettingsContext, onClose: () => void): Setting
     const preview = el('div', { class: 'profile-preview' });
     const swatches = el('div', { class: 'swatches', role: 'radiogroup', 'aria-label': 'Avatar colour' });
     const save = el('button', { class: 'btn primary', type: 'submit' }, 'Save changes');
+    const photoActions = el('div', { class: 'form-actions photo-actions' });
+
+    const currentPhoto = (): string | null => (pendingPhoto === undefined ? user.avatar : pendingPhoto.previewUrl);
+
+    async function choosePhoto(): Promise<void> {
+      uploading = true;
+      refresh();
+      try {
+        const uploaded = await pickAndUploadSquare(ctx.token, 'avatar');
+        if (uploaded) pendingPhoto = uploaded;
+      } catch (error) {
+        toast(root, (error as Error).message);
+      }
+      uploading = false;
+      refresh();
+    }
 
     function refresh(): void {
       const name = nameInput.value.trim();
-      const dirty = name !== user.displayName || bioInput.value.trim() !== user.bio || color !== user.color;
+      const dirty =
+        name !== user.displayName ||
+        bioInput.value.trim() !== user.bio ||
+        color !== user.color ||
+        pendingPhoto !== undefined;
       preview.replaceChildren(
-        avatar({ id: user.id, displayName: name || user.username, color }, 'xl'),
+        avatar({ id: user.id, displayName: name || user.username, color, avatar: currentPhoto() }, 'xl'),
         el(
           'div',
           {},
           el('strong', { class: 'preview-name' }, name || user.username),
-          el('div', { class: 'muted' }, `@${user.username}`)
+          el('div', { class: 'muted' }, `@${user.username}`),
+          photoActions
         )
+      );
+      fill(photoActions,
+        el(
+          'button',
+          { class: 'btn secondary', type: 'button', disabled: uploading, onclick: () => void choosePhoto() },
+          icon('upload', 16),
+          uploading ? 'Uploading…' : 'Upload photo'
+        ),
+        currentPhoto()
+          ? el(
+              'button',
+              {
+                class: 'btn secondary',
+                type: 'button',
+                onclick: () => {
+                  pendingPhoto = { id: null, previewUrl: null };
+                  refresh();
+                }
+              },
+              'Remove photo'
+            )
+          : null
       );
       counter.textContent = `${bioInput.value.length}/${LIMITS.bioMax}`;
       swatches.replaceChildren(
@@ -150,7 +198,7 @@ export function openSettings(ctx: SettingsContext, onClose: () => void): Setting
           return swatch;
         })
       );
-      save.disabled = !dirty || !name;
+      save.disabled = !dirty || !name || uploading;
     }
     nameInput.addEventListener('input', refresh);
     bioInput.addEventListener('input', refresh);
@@ -165,7 +213,8 @@ export function openSettings(ctx: SettingsContext, onClose: () => void): Setting
             type: 'update_profile',
             displayName: nameInput.value,
             bio: bioInput.value,
-            color
+            color,
+            avatar: pendingPhoto?.id
           });
         }
       },

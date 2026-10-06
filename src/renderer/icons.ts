@@ -46,6 +46,23 @@ const ICONS = {
     }
   ],
   bell: [{ tag: 'path', d: 'M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0' }],
+  paperclip: [
+    {
+      tag: 'path',
+      d: 'M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48'
+    }
+  ],
+  trash: [
+    { tag: 'path', d: 'M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6' }
+  ],
+  shield: [{ tag: 'path', d: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' }],
+  crown: [{ tag: 'path', d: 'M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5L3 8z' }],
+  bot: [
+    { tag: 'rect', x: 4, y: 8, width: 16, height: 12, rx: 3 },
+    { tag: 'path', d: 'M12 8V4M9 14h.01M15 14h.01M9 17.5h6' }
+  ],
+  upload: [{ tag: 'path', d: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12' }],
+  hash: [{ tag: 'path', d: 'M4 9h16M4 15h16M10 3 8 21M16 3l-2 18' }],
   info: [
     { tag: 'circle', cx: 12, cy: 12, r: 10 },
     { tag: 'path', d: 'M12 16v-4M12 8h.01' }

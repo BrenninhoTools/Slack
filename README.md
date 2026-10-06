@@ -1,6 +1,6 @@
 # Slack
 
-A Discord-style chat platform: communities with text channels, real-time messaging, presence, typing indicators, user profiles and app settings.
+A Discord-style chat platform: communities with text channels, real-time messaging, images, profile photos, moderators and a moderation bot.
 
 - **Desktop** — Electron + TypeScript for Windows, macOS and Linux.
 - **Mobile** — the same TypeScript UI wrapped with [Capacitor](https://capacitorjs.com) for Android and iOS.
@@ -26,8 +26,15 @@ Create an account on the login screen. Every new user automatically joins the **
 
 ## Features
 
-- Communities (guilds), text channels, invite codes, unread markers, member list with online status
-- **Profiles** — display name, "about me", avatar colour and password change; changes show up instantly for everyone who shares a community with you. Click any avatar, name or member to see their profile.
+- Communities (guilds) with text channels, invite codes, unread markers and a member list with online status
+- **Images** — attach up to 4 photos per message with the paperclip, by pasting, or by dragging them in. Big photos are downscaled in the app before upload (phone shots are often 10 MB+). Click an image to open it full size. PNG, JPEG, GIF and WebP; GIFs are sent untouched so they stay animated.
+- **Profiles** — display name, "about me", a profile photo (cropped to a square) or a coloured initials avatar, and password change. Changes show up instantly for everyone who shares a community with you. Click any avatar, name or member to see their profile.
+- **Better communities** — an icon and description, rename/delete channels, a regenerable invite code, leave or delete a community, and a settings dialog (the gear next to the community name).
+- **Moderation** — three roles: *owner*, *moderator* and *member*. Moderators can create/rename/delete channels, delete any message, mute, kick and ban members, regenerate the invite and run the bot. Only the owner can promote moderators, edit the community or delete it. Nobody can act on the owner, and moderators can't act on each other.
+- **Guardian, the moderation bot** — built into every community and managed from *Community settings → Bot*:
+  - welcomes new members
+  - auto-moderation: blocked words, link blocking and anti-spam (owners and moderators are exempt)
+  - slash commands: `/help`, `/ping`, `/roll 2d6`, `/flip`, `/members`, plus moderator-only `/purge N`, `/mute @name [minutes]`, `/unmute @name`, `/kick @name`
 - **App settings** (per device) — dark / light / system theme, font size, cozy or compact messages, 12/24-hour clock, and desktop notifications for messages that arrive while the app is in the background
 - Responsive layout: on phones the channel list and member list become slide-in drawers and settings open full-screen
 
@@ -78,7 +85,7 @@ Connecting to the server from a phone:
 - Enter the server as `host:port` — the app adds `ws://` for you. Use `wss://` for any server on the internet.
 - **Android emulator:** `10.0.2.2:3001` (the default there). **iOS simulator:** `localhost:3001`.
 - **A real phone** needs your computer's LAN address, e.g. `192.168.1.20:3001`, and the server must be reachable (allow port 3001 through the firewall).
-- Plain `ws://` is allowed on both platforms so you can develop against a local server. Use TLS (`wss://`) in production.
+- Picking photos uses the system picker on both platforms. Plain `ws://` is allowed on both platforms so you can develop against a local server. Use TLS (`wss://`) in production.
 
 ## CI
 
@@ -102,13 +109,17 @@ Nothing is code-signed yet:
 ## Server
 
 ```bash
-PORT=3001 DATA_FILE=data/slack.json npm run server
+PORT=3001 DATA_FILE=data/slack.json ADMIN_USERNAMES=alice npm run server
 ```
 
-| Variable    | Default           | Description                                       |
-| ----------- | ----------------- | ------------------------------------------------- |
-| `PORT`      | `3001`            | Listening port (`GET /health` for a health check) |
-| `DATA_FILE` | `data/slack.json` | JSON persistence file; set to empty for in-memory |
+| Variable          | Default                  | Description                                                                  |
+| ----------------- | ------------------------ | ---------------------------------------------------------------------------- |
+| `PORT`            | `3001`                   | Listening port (`GET /health` for a health check)                            |
+| `DATA_FILE`       | `data/slack.json`        | JSON persistence file; set to empty for in-memory                            |
+| `UPLOAD_DIR`      | `<DATA_FILE dir>/uploads`| Where uploaded images are stored                                            |
+| `ADMIN_USERNAMES` | *(none)*                 | Comma-separated usernames that moderate the Public Square (it has no owner)  |
+
+Images are uploaded over HTTP (`POST /upload`, authorised with your session token) and served from `GET /files/<id>`; everything else uses the WebSocket. Uploads are identified by their bytes (never the `Content-Type`), SVG is rejected, files get random unguessable ids, and uploads that are never attached to anything are deleted after an hour. Limits: 2 MB for avatars and icons, 8 MB for message images. Anyone who has an image's link can open it, so don't treat images as private.
 
 `npm run build:server` produces a self-contained `dist/server/index.js` that runs with just `node`. Put it behind a TLS reverse proxy and connect clients with `wss://your-host`.
 
@@ -120,7 +131,7 @@ All frames are JSON objects with a `type` field. The full list of events lives i
 
 ## Roadmap
 
-Direct messages, message editing/deleting, roles and permissions, file and image uploads, voice channels (WebRTC), push notifications on mobile, a real database, auto-update and code signing.
+Direct messages, message editing, custom roles and per-channel permissions, non-image file uploads, voice channels (WebRTC), push notifications on mobile, a real database or object storage for images, auto-update and code signing.
 
 ## License
 

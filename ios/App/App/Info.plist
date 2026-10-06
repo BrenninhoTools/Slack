@@ -69,6 +69,10 @@
 		<key>NSAllowsArbitraryLoadsInWebContent</key>
 		<true/>
 	</dict>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Slack needs access to your photos so you can share images and set a profile picture.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Slack uses the camera so you can take a photo to share or use as a profile picture.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Slack connects to your chat server, which may be on your local network.</string>
 	<key>UIViewControllerBasedStatusBarAppearance</key>

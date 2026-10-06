@@ -5,6 +5,7 @@ import { createChatView } from './chat';
 import { clear, el } from './dom';
 import { Gateway } from './gateway';
 import { createLoginView } from './login';
+import { setMediaBase } from './media';
 import { defaultServerUrl, normalizeServerUrl } from './platform';
 import { applySettings } from './settings';
 import type { PublicUser } from '../shared/protocol';
@@ -66,12 +67,13 @@ function showLogin(notice?: string): void {
   );
 }
 
-function showChat(user: PublicUser): void {
+function showChat(user: PublicUser, token: string): void {
   setView(() =>
     createChatView(root, {
       user,
       gateway,
       serverUrl: prefs.serverUrl,
+      token,
       onLogout() {
         gateway.send({ type: 'logout' });
         prefs = { ...prefs, token: null };
@@ -111,7 +113,8 @@ async function authenticate(
       if (event.type === 'auth_ok') {
         prefs = { serverUrl, token: event.token };
         savePrefs(prefs);
-        showChat(event.user);
+        setMediaBase(serverUrl);
+        showChat(event.user, event.token);
         resolve(null);
       } else if (event.type === 'error') {
         if (event.code === 'invalid_token') {

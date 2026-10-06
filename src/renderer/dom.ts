@@ -22,6 +22,11 @@ export function el<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
+/** Replaces an element's children; null/undefined/false entries are skipped (handy for conditional UI). */
+export function fill(parent: Element, ...children: Child[]): void {
+  parent.replaceChildren(...children.filter((c): c is Node | string => c !== null && c !== undefined && c !== false));
+}
+
 export function clear(node: Element): void {
   node.replaceChildren();
 }

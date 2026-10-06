@@ -1,7 +1,7 @@
 {
   "name": "slack",
   "productName": "Slack",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A Discord-style chat platform for desktop (Electron), Android and iOS (Capacitor), with a real-time WebSocket server.",
   "author": "Brenninho",
   "license": "MIT",

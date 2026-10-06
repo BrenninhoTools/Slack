@@ -1,18 +1,24 @@
 import {
   LIMITS,
+  UPLOAD_MAX_BYTES,
+  type AttachmentDTO,
   type GuildDTO,
   type MessageDTO,
   type PublicUser,
   type ServerEvent
 } from '../shared/protocol';
-import { avatar } from './avatar';
-import { clear, el, initials } from './dom';
+import { avatar, guildIconContent } from './avatar';
+import { clear, el } from './dom';
 import type { Gateway, GatewayStatus } from './gateway';
 import { icon } from './icons';
-import { closeTopModal, openModal, toast as showToast } from './modal';
+import { IMAGE_ACCEPT, isSupportedImage, prepareImage } from './images';
+import { mediaUrl, uploadImage } from './media';
+import { closeTopModal, confirmDialog, openLightbox, openModal, toast as showToast } from './modal';
 import { isMobile } from './platform';
-import { openProfileCard } from './profileCard';
+import { openProfileCard, roleBadge } from './profileCard';
+import { isModerator } from './roles';
 import { getSettings, notify, onSettingsChange } from './settings';
+import { openGuildSettings, type GuildSettingsHandle } from './guildSettings';
 import { openSettings, type SettingsHandle } from './settingsView';
 import type { View } from './view';
 
@@ -20,16 +26,27 @@ export interface ChatDeps {
   user: PublicUser;
   gateway: Gateway;
   serverUrl: string;
+  /** Session token, needed to authorise image uploads. */
+  token: string;
   onLogout(): void;
 }
 
 const COMPACT_WINDOW_MS = 5 * 60_000;
 const TYPING_TTL_MS = 5000;
 const TYPING_SEND_INTERVAL_MS = 3000;
+const ATTACHMENT_MAX_SIDE = 2048;
+
+/** An image waiting in the composer: still uploading, or uploaded and ready to send. */
+interface PendingImage {
+  name: string;
+  previewUrl: string | null;
+  state: 'uploading' | 'ready';
+  id: string | null;
+}
 
 export function createChatView(
   root: HTMLElement,
-  { user: initialUser, gateway, serverUrl, onLogout }: ChatDeps
+  { user: initialUser, gateway, serverUrl, token, onLogout }: ChatDeps
 ): View {
   // ------------------------------------------------------------------ state
   let me = initialUser;
@@ -42,11 +59,14 @@ export function createChatView(
   const unread = new Set<string>();
   const online = new Set<string>([me.id]);
   const typing = new Map<string, Map<string, { name: string; timer: number }>>();
+  const pending: PendingImage[] = [];
   let lastTypingSent = 0;
   let settingsHandle: SettingsHandle | null = null;
+  let guildSettingsHandle: GuildSettingsHandle | null = null;
   let lastClock = getSettings().clock;
 
   const toast = (text: string) => showToast(root, text);
+  const isOnline = (u: PublicUser) => u.bot === true || online.has(u.id);
 
   // -------------------------------------------------------------------- DOM
   const guildRail = el('nav', { class: 'guild-rail', 'aria-label': 'Communities' });
@@ -56,6 +76,30 @@ export function createChatView(
   const chatHeader = el('header', { class: 'chat-header' });
   const messageList = el('div', { class: 'message-list' });
   const typingBar = el('div', { class: 'typing-bar' });
+  const pendingStrip = el('div', { class: 'pending-strip', 'aria-label': 'Images to send' });
+  pendingStrip.hidden = true;
+
+  const fileInput = el('input', {
+    type: 'file',
+    accept: IMAGE_ACCEPT,
+    multiple: true,
+    hidden: true,
+    onchange: () => {
+      void addFiles([...(fileInput.files ?? [])]);
+      fileInput.value = '';
+    }
+  });
+  const attachButton = el(
+    'button',
+    {
+      class: 'icon-btn attach-btn',
+      type: 'button',
+      title: 'Attach images',
+      'aria-label': 'Attach images',
+      onclick: () => fileInput.click()
+    },
+    icon('paperclip', 22)
+  );
   const input = el('textarea', {
     class: 'composer-input',
     rows: 1,
@@ -72,6 +116,12 @@ export function createChatView(
       input.style.height = 'auto';
       input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
       announceTyping();
+    },
+    onpaste: (event: ClipboardEvent) => {
+      const images = [...(event.clipboardData?.files ?? [])].filter(isSupportedImage);
+      if (images.length === 0) return;
+      event.preventDefault();
+      void addFiles(images);
     }
   });
   const sendButton = el(
@@ -83,21 +133,39 @@ export function createChatView(
   const banner = el('div', { class: 'banner', role: 'status' }, 'Connection lost. Reconnecting…');
   banner.hidden = true;
   const backdrop = el('div', { class: 'drawer-backdrop', onclick: () => closeDrawers() });
+  const chatEl = el(
+    'main',
+    { class: 'chat' },
+    chatHeader,
+    messageList,
+    typingBar,
+    el('div', { class: 'composer' }, pendingStrip, el('div', { class: 'composer-row' }, attachButton, input, sendButton), fileInput)
+  );
   const appEl = el(
     'div',
     { class: 'app' },
     el('div', { class: 'nav-drawer' }, guildRail, el('aside', { class: 'sidebar' }, sidebarHeader, channelList, userBar)),
-    el(
-      'main',
-      { class: 'chat' },
-      chatHeader,
-      messageList,
-      typingBar,
-      el('div', { class: 'composer' }, input, sendButton)
-    ),
+    chatEl,
     memberList,
     backdrop
   );
+
+  // Drag and drop images anywhere on the chat.
+  const hasFiles = (event: DragEvent) => event.dataTransfer?.types.includes('Files') === true;
+  chatEl.addEventListener('dragover', (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    chatEl.classList.add('dropping');
+  });
+  chatEl.addEventListener('dragleave', (event) => {
+    if (event.relatedTarget === null || !chatEl.contains(event.relatedTarget as Node)) chatEl.classList.remove('dropping');
+  });
+  chatEl.addEventListener('drop', (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    chatEl.classList.remove('dropping');
+    void addFiles([...(event.dataTransfer?.files ?? [])]);
+  });
 
   clear(root);
   root.append(banner, appEl);
@@ -138,19 +206,30 @@ export function createChatView(
     }
     closeDrawers();
     renderAll();
-    input.disabled = !channelId;
-    input.placeholder = activeChannel() ? `Message #${activeChannel()?.name}` : 'Select a channel';
     if (channelId && !isMobile()) input.focus();
   }
 
   // ---------------------------------------------------------------- actions
   function sendMessage(): void {
     const content = input.value.trim();
-    if (!content || !activeChannelId) return;
-    gateway.send({ type: 'send_message', channelId: activeChannelId, content });
+    if (!activeChannelId) return;
+    if (pending.some((p) => p.state === 'uploading')) {
+      toast('Please wait for your images to finish uploading.');
+      return;
+    }
+    const ready = pending.filter((p) => p.state === 'ready' && p.id !== null);
+    if (!content && ready.length === 0) return;
+
+    gateway.send({
+      type: 'send_message',
+      channelId: activeChannelId,
+      content,
+      attachmentIds: ready.map((p) => p.id as string)
+    });
     input.value = '';
     input.style.height = 'auto';
     lastTypingSent = 0;
+    clearPending();
   }
 
   function announceTyping(): void {
@@ -172,14 +251,107 @@ export function createChatView(
   function openSettingsDialog(): void {
     closeDrawers();
     settingsHandle = openSettings(
-      { root, gateway, getUser: () => me, serverUrl, onLogout },
+      { root, gateway, token, getUser: () => me, serverUrl, onLogout },
       () => {
         settingsHandle = null;
       }
     );
   }
 
-  const showProfile = (target: PublicUser) => openProfileCard(root, target, online.has(target.id));
+  function openGuildSettingsDialog(guild: GuildDTO): void {
+    closeDrawers();
+    guildSettingsHandle = openGuildSettings(
+      {
+        root,
+        gateway,
+        token,
+        me: () => me,
+        getGuild: (id) => guilds.find((g) => g.id === id),
+        isOnline: (id) => online.has(id)
+      },
+      guild.id,
+      () => {
+        guildSettingsHandle = null;
+      }
+    );
+  }
+
+  const showProfile = (target: PublicUser) =>
+    openProfileCard({ root, gateway, me, guild: activeGuild(), isOnline: (id) => online.has(id) }, target);
+
+  async function deleteMessage(message: MessageDTO): Promise<void> {
+    const ok = await confirmDialog(root, {
+      title: 'Delete message',
+      message: 'This message will be removed for everyone. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true
+    });
+    if (ok) gateway.send({ type: 'delete_message', channelId: message.channelId, messageId: message.id });
+  }
+
+  // ---------------------------------------------------------- attachments
+  async function addFiles(files: File[]): Promise<void> {
+    for (const file of files) {
+      if (!isSupportedImage(file)) {
+        toast('Only PNG, JPEG, GIF and WebP images can be attached.');
+        continue;
+      }
+      if (pending.length >= LIMITS.attachmentsPerMessage) {
+        toast(`You can attach up to ${LIMITS.attachmentsPerMessage} images per message.`);
+        break;
+      }
+      const item: PendingImage = { name: file.name, previewUrl: null, state: 'uploading', id: null };
+      pending.push(item);
+      renderPending();
+      void uploadPending(item, file);
+    }
+  }
+
+  async function uploadPending(item: PendingImage, file: File): Promise<void> {
+    try {
+      const prepared = await prepareImage(file, { maxSide: ATTACHMENT_MAX_SIDE, maxBytes: UPLOAD_MAX_BYTES.attachment });
+      item.previewUrl = prepared.previewUrl;
+      renderPending();
+      item.id = (await uploadImage(token, 'attachment', prepared)).id;
+      item.state = 'ready';
+    } catch (error) {
+      toast((error as Error).message);
+      removePending(item);
+      return;
+    }
+    renderPending();
+  }
+
+  function removePending(item: PendingImage): void {
+    const index = pending.indexOf(item);
+    if (index !== -1) pending.splice(index, 1);
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    renderPending();
+  }
+
+  function clearPending(): void {
+    pending.splice(0).forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
+    renderPending();
+  }
+
+  function renderPending(): void {
+    pendingStrip.hidden = pending.length === 0;
+    pendingStrip.replaceChildren(
+      ...pending.map((item) =>
+        el(
+          'div',
+          { class: `pending-item ${item.state}` },
+          item.previewUrl ? el('img', { src: item.previewUrl, alt: item.name }) : null,
+          item.state === 'uploading' ? el('span', { class: 'pending-spinner', role: 'progressbar', 'aria-label': 'Uploading' }) : null,
+          el(
+            'button',
+            { class: 'pending-remove', type: 'button', 'aria-label': `Remove ${item.name}`, onclick: () => removePending(item) },
+            icon('close', 14)
+          )
+        )
+      )
+    );
+  }
 
   // -------------------------------------------------------------- rendering
   function renderAll(): void {
@@ -189,22 +361,29 @@ export function createChatView(
     renderMessages();
     renderMembers();
     renderTyping();
+    renderComposer();
+  }
+
+  function renderComposer(): void {
+    const channel = activeChannel();
+    input.disabled = !channel;
+    attachButton.disabled = !channel;
+    input.placeholder = channel ? `Message #${channel.name}` : 'Select a channel';
   }
 
   function renderGuilds(): void {
     clear(guildRail);
     for (const guild of guilds) {
       const hasUnread = guild.channels.some((c) => unread.has(c.id));
+      const classes = ['guild-btn'];
+      if (guild.id === activeGuildId) classes.push('active');
+      if (hasUnread) classes.push('unread');
+      if (guild.icon) classes.push('has-icon');
       guildRail.append(
         el(
           'button',
-          {
-            class: `guild-btn${guild.id === activeGuildId ? ' active' : ''}${hasUnread ? ' unread' : ''}`,
-            title: guild.name,
-            'aria-label': guild.name,
-            onclick: () => selectGuild(guild.id)
-          },
-          initials(guild.name)
+          { class: classes.join(' '), title: guild.name, 'aria-label': guild.name, onclick: () => selectGuild(guild.id) },
+          guildIconContent(guild)
         )
       );
     }
@@ -235,19 +414,32 @@ export function createChatView(
     sidebarHeader.append(
       el('strong', { class: 'truncate' }, guild.name),
       el(
-        'button',
-        { class: 'icon-btn', title: 'Copy invite code', 'aria-label': 'Copy invite code', onclick: () => void copyInvite(guild) },
-        icon('copy')
+        'span',
+        { class: 'header-actions' },
+        el(
+          'button',
+          { class: 'icon-btn', title: 'Copy invite code', 'aria-label': 'Copy invite code', onclick: () => void copyInvite(guild) },
+          icon('copy')
+        ),
+        el(
+          'button',
+          {
+            class: 'icon-btn',
+            title: 'Community settings',
+            'aria-label': 'Community settings',
+            onclick: () => openGuildSettingsDialog(guild)
+          },
+          icon('settings')
+        )
       )
     );
 
-    const isOwner = guild.ownerId === me.id;
     channelList.append(
       el(
         'div',
         { class: 'section-title' },
         el('span', {}, 'Text channels'),
-        isOwner &&
+        isModerator(guild, me.id) &&
           el(
             'button',
             { class: 'icon-btn', title: 'Create channel', 'aria-label': 'Create channel', onclick: () => openChannelModal(guild) },
@@ -275,7 +467,7 @@ export function createChatView(
       el(
         'button',
         { class: 'user-bar-profile', title: 'Open settings', onclick: openSettingsDialog },
-        avatar(me, 'sm', online),
+        avatar(me, 'sm', true),
         el(
           'div',
           { class: 'user-bar-name' },
@@ -311,6 +503,17 @@ export function createChatView(
     );
   }
 
+  const messageContext = () => {
+    const guild = activeGuild();
+    return {
+      onProfile: showProfile,
+      canDelete: (message: MessageDTO) =>
+        message.author.id === me.id || (guild !== undefined && isModerator(guild, me.id)),
+      onDelete: (message: MessageDTO) => void deleteMessage(message),
+      onImage: (attachment: AttachmentDTO) => openLightbox(root, mediaUrl(attachment.url), attachment.name)
+    };
+  };
+
   function renderMessages(keepScroll = false): void {
     const previousScroll = messageList.scrollTop;
     clear(messageList);
@@ -327,7 +530,8 @@ export function createChatView(
     if (list.length === 0) {
       messageList.append(el('div', { class: 'empty' }, `This is the beginning of #${channel.name}. Say hello!`));
     }
-    list.forEach((message, i) => messageList.append(messageNode(message, list[i - 1], showProfile)));
+    const context = messageContext();
+    list.forEach((message, i) => messageList.append(messageNode(message, list[i - 1], context)));
     messageList.scrollTop = keepScroll ? previousScroll : messageList.scrollHeight;
   }
 
@@ -343,7 +547,7 @@ export function createChatView(
       messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 80 ||
       message.author.id === me.id;
     if (list.length === 1) clear(messageList);
-    messageList.append(messageNode(message, previous, showProfile));
+    messageList.append(messageNode(message, previous, messageContext()));
     if (stickToBottom) messageList.scrollTop = messageList.scrollHeight;
   }
 
@@ -352,8 +556,8 @@ export function createChatView(
     const guild = activeGuild();
     if (!guild) return;
     const byName = (a: PublicUser, b: PublicUser) => a.displayName.localeCompare(b.displayName);
-    const onlineMembers = guild.members.filter((m) => online.has(m.id)).sort(byName);
-    const offlineMembers = guild.members.filter((m) => !online.has(m.id)).sort(byName);
+    const onlineMembers = guild.members.filter(isOnline).sort(byName);
+    const offlineMembers = guild.members.filter((m) => !isOnline(m)).sort(byName);
 
     const section = (title: string, members: PublicUser[], offline: boolean) => {
       if (members.length === 0) return;
@@ -363,8 +567,9 @@ export function createChatView(
           el(
             'button',
             { class: `member${offline ? ' offline' : ''}`, onclick: () => showProfile(member) },
-            avatar(member, 'sm', online),
-            el('span', { class: 'truncate' }, member.displayName)
+            avatar(member, 'sm', isOnline(member)),
+            el('span', { class: 'truncate' }, member.displayName),
+            roleBadge(guild, member)
           )
         );
       }
@@ -448,6 +653,7 @@ export function createChatView(
   // ----------------------------------------------------------------- events
   function handleEvent(event: ServerEvent): void {
     settingsHandle?.handleEvent(event);
+    guildSettingsHandle?.handleEvent(event);
 
     switch (event.type) {
       case 'ready': {
@@ -473,8 +679,39 @@ export function createChatView(
       }
       case 'guild_update': {
         guilds = guilds.map((g) => (g.id === event.guild.id ? event.guild : g));
+        if (event.guild.id === activeGuildId && !activeChannel()) {
+          // The channel we were looking at was deleted.
+          selectChannel(event.guild.channels[0]?.id ?? null);
+          break;
+        }
+        renderGuilds();
         renderSidebar();
+        renderHeader();
         renderMembers();
+        renderComposer();
+        break;
+      }
+      case 'guild_remove': {
+        const removed = guilds.find((g) => g.id === event.guildId);
+        guilds = guilds.filter((g) => g.id !== event.guildId);
+        if (removed) {
+          const text = {
+            kicked: `You were removed from ${removed.name}.`,
+            banned: `You were banned from ${removed.name}.`,
+            deleted: `${removed.name} was deleted by its owner.`,
+            left: ''
+          }[event.reason];
+          if (text) toast(text);
+        }
+        if (event.guildId === activeGuildId) {
+          activeGuildId = null;
+          activeChannelId = null;
+          const next = guilds[0];
+          if (next) selectGuild(next.id);
+          else renderAll();
+        } else {
+          renderGuilds();
+        }
         break;
       }
       case 'history': {
@@ -498,12 +735,20 @@ export function createChatView(
           const where = findChannel(message.channelId);
           notify(
             `${message.author.displayName}${where ? ` · #${where.channel.name} (${where.guild.name})` : ''}`,
-            message.content.slice(0, 140)
+            message.content ? message.content.slice(0, 140) : 'Sent an image'
           );
         }
         renderGuilds();
         renderSidebar();
         renderTyping();
+        break;
+      }
+      case 'message_delete': {
+        const list = messages.get(event.channelId);
+        if (list) {
+          messages.set(event.channelId, list.filter((m) => m.id !== event.messageId));
+          if (event.channelId === activeChannelId) renderMessages(true);
+        }
         break;
       }
       case 'presence_update': {
@@ -538,11 +783,15 @@ export function createChatView(
         renderTyping();
         break;
       }
+      case 'notice':
+        toast(event.message);
+        break;
       case 'error':
         toast(event.message);
         break;
       case 'auth_ok':
       case 'password_changed':
+      case 'guild_settings':
         break;
     }
   }
@@ -560,7 +809,6 @@ export function createChatView(
   });
 
   renderAll();
-  input.disabled = true;
 
   return {
     handleEvent,
@@ -568,7 +816,8 @@ export function createChatView(
     handleBack: () => closeTopModal() || closeDrawers(),
     destroy() {
       stopSettingsListener();
-      closeTopModal();
+      while (closeTopModal());
+      clearPending();
       typing.forEach((byUser) => byUser.forEach((t) => window.clearTimeout(t.timer)));
       clear(root);
     }
@@ -577,30 +826,79 @@ export function createChatView(
 
 // ------------------------------------------------------------------ helpers
 
-function messageNode(
-  message: MessageDTO,
-  previous: MessageDTO | undefined,
-  onProfile: (user: PublicUser) => void
-): HTMLElement {
+interface MessageContext {
+  onProfile(user: PublicUser): void;
+  canDelete(message: MessageDTO): boolean;
+  onDelete(message: MessageDTO): void;
+  onImage(attachment: AttachmentDTO): void;
+}
+
+function messageNode(message: MessageDTO, previous: MessageDTO | undefined, context: MessageContext): HTMLElement {
   const compact =
     previous !== undefined &&
     previous.author.id === message.author.id &&
     message.timestamp - previous.timestamp < COMPACT_WINDOW_MS;
-  const text = el('div', { class: 'msg-text' }, message.content);
+
+  const body: Node[] = [];
+  if (message.content) body.push(el('div', { class: 'msg-text' }, message.content));
+  if (message.attachments.length > 0) {
+    body.push(
+      el(
+        'div',
+        { class: 'msg-attachments' },
+        ...message.attachments.map((attachment) =>
+          el(
+            'button',
+            { class: 'image-btn', type: 'button', title: attachment.name, onclick: () => context.onImage(attachment) },
+            el('img', {
+              class: 'msg-image',
+              src: mediaUrl(attachment.url),
+              alt: attachment.name,
+              loading: 'lazy',
+              width: attachment.width || undefined,
+              height: attachment.height || undefined
+            })
+          )
+        )
+      )
+    );
+  }
+
+  const actions = context.canDelete(message)
+    ? el(
+        'div',
+        { class: 'msg-actions' },
+        el(
+          'button',
+          {
+            class: 'icon-btn danger-text',
+            title: 'Delete message',
+            'aria-label': 'Delete message',
+            onclick: () => context.onDelete(message)
+          },
+          icon('trash', 16)
+        )
+      )
+    : null;
 
   if (compact) {
     return el(
       'div',
       { class: 'msg grouped' },
       el('time', { class: 'msg-gutter-time', title: fullTime(message.timestamp) }, shortTime(message.timestamp)),
-      text
+      el('div', { class: 'msg-body' }, ...body),
+      actions
     );
   }
-  const open = () => onProfile(message.author);
+  const open = () => context.onProfile(message.author);
   return el(
     'div',
     { class: 'msg' },
-    el('button', { class: 'avatar-btn', 'aria-label': `View ${message.author.displayName}'s profile`, onclick: open }, avatar(message.author, 'md')),
+    el(
+      'button',
+      { class: 'avatar-btn', 'aria-label': `View ${message.author.displayName}'s profile`, onclick: open },
+      avatar(message.author, 'md')
+    ),
     el(
       'div',
       { class: 'msg-body' },
@@ -608,10 +906,12 @@ function messageNode(
         'div',
         { class: 'msg-meta' },
         el('button', { class: 'msg-author', title: `@${message.author.username}`, onclick: open }, message.author.displayName),
+        message.author.bot ? el('span', { class: 'badge bot' }, icon('bot', 12), 'BOT') : null,
         el('time', { class: 'msg-time' }, fullTime(message.timestamp))
       ),
-      text
-    )
+      ...body
+    ),
+    actions
   );
 }
 

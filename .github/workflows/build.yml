@@ -83,8 +83,8 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - uses: android-actions/setup-android@v3
-
+      # The ubuntu runner image already ships the Android SDK with licenses accepted
+      # (ANDROID_HOME); Gradle downloads any missing platform on demand.
       - uses: gradle/actions/setup-gradle@v4
 
       - run: npm ci
